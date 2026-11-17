@@ -3,9 +3,11 @@
 AWS architecture we'll build
 I'll use ECS Fargate + Application Load Balancer + Amazon RDS MySQL. RDS is a better choice than running MySQL as a temporary ECS container because your orders and products need persistent database storage.
 
+<img width="800" height="553" alt="Screenshot 2026-11-17 193211" src="https://github.com/user-attachments/assets/a427e84e-87df-4c16-8133-94213c93ba08" />
 
 
 
+Deployment flow: Docker Hub → ECS Fargate → Load Balancer → Browser, with the backend connected privately to RDS.
 
 
 Deploy the existing React + FastAPI + MySQL Coffee Shop application to AWS ECS Fargate.
