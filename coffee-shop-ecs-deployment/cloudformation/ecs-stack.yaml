@@ -1,0 +1,299 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Coffee Shop ECS Fargate deployment using an existing default VPC
+
+Parameters:
+  VpcId:
+    Type: AWS::EC2::VPC::Id
+  SubnetIds:
+    Type: List<AWS::EC2::Subnet::Id>
+    Description: Two subnets in different Availability Zones
+  DockerHubUsername:
+    Type: String
+    Default: shiva029
+  ImageTag:
+    Type: String
+    Default: v2
+  DBInstanceClass:
+    Type: String
+    Default: db.t3.micro
+    AllowedValues: [db.t3.micro, db.t3.small, db.t4g.micro, db.t4g.small]
+
+Resources:
+  AlbSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Public HTTP access to Coffee Shop ALB
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: 0.0.0.0/0
+
+  AppSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: App containers accept traffic only from ALB
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          SourceSecurityGroupId: !Ref AlbSG
+        - IpProtocol: tcp
+          FromPort: 8000
+          ToPort: 8000
+          SourceSecurityGroupId: !Ref AlbSG
+
+  DbSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: MySQL accepts traffic only from ECS application tasks
+      VpcId: !Ref VpcId
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 3306
+          ToPort: 3306
+          SourceSecurityGroupId: !Ref AppSG
+
+  DbSecret:
+    Type: AWS::SecretsManager::Secret
+    Properties:
+      Name: !Sub '${AWS::StackName}/mysql'
+      GenerateSecretString:
+        SecretStringTemplate: '{"username":"coffeeadmin"}'
+        GenerateStringKey: password
+        PasswordLength: 24
+        ExcludePunctuation: true
+
+  DbSubnetGroup:
+    Type: AWS::RDS::DBSubnetGroup
+    Properties:
+      DBSubnetGroupDescription: Coffee Shop database subnets
+      SubnetIds: !Ref SubnetIds
+
+  MySQL:
+    Type: AWS::RDS::DBInstance
+    Properties:
+      Engine: mysql
+      DBInstanceClass: !Ref DBInstanceClass
+      AllocatedStorage: 20
+      StorageType: gp2
+      StorageEncrypted: true
+      DBName: coffeeshop
+      MasterUsername: coffeeadmin
+      MasterUserPassword: !Sub '{{resolve:secretsmanager:${DbSecret}:SecretString:password}}'
+      DBSubnetGroupName: !Ref DbSubnetGroup
+      VPCSecurityGroups: [!Ref DbSG]
+      PubliclyAccessible: false
+      MultiAZ: false
+      BackupRetentionPeriod: 0
+      DeletionProtection: false
+
+  Cluster:
+    Type: AWS::ECS::Cluster
+    Properties:
+      ClusterName: coffee-shop-cluster
+
+  TaskExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: [ecs-tasks.amazonaws.com]
+            Action: [sts:AssumeRole]
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AmazonECSTaskExecutionRolePolicy
+      Policies:
+        - PolicyName: ReadDbPassword
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action: [secretsmanager:GetSecretValue]
+                Resource: !Ref DbSecret
+
+  BackendLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/coffee-shop/backend
+      RetentionInDays: 7
+
+  FrontendLogs:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: /ecs/coffee-shop/frontend
+      RetentionInDays: 7
+
+  BackendTask:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: coffee-shop-backend
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: '256'
+      Memory: '512'
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: backend
+          Image: !Sub '${DockerHubUsername}/coffee-shop-backend:${ImageTag}'
+          Essential: true
+          PortMappings:
+            - ContainerPort: 8000
+              Protocol: tcp
+          Environment:
+            - Name: MYSQL_HOST
+              Value: !GetAtt MySQL.Endpoint.Address
+            - Name: MYSQL_PORT
+              Value: '3306'
+            - Name: MYSQL_DB
+              Value: coffeeshop
+            - Name: MYSQL_USER
+              Value: coffeeadmin
+          Secrets:
+            - Name: MYSQL_PASSWORD
+              ValueFrom: !Sub '${DbSecret}:password::'
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: /ecs/coffee-shop/backend
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  FrontendTask:
+    Type: AWS::ECS::TaskDefinition
+    Properties:
+      Family: coffee-shop-frontend
+      RequiresCompatibilities: [FARGATE]
+      NetworkMode: awsvpc
+      Cpu: '256'
+      Memory: '512'
+      ExecutionRoleArn: !GetAtt TaskExecutionRole.Arn
+      ContainerDefinitions:
+        - Name: frontend
+          Image: !Sub '${DockerHubUsername}/coffee-shop-frontend:${ImageTag}'
+          Essential: true
+          PortMappings:
+            - ContainerPort: 80
+              Protocol: tcp
+          LogConfiguration:
+            LogDriver: awslogs
+            Options:
+              awslogs-group: /ecs/coffee-shop/frontend
+              awslogs-region: !Ref AWS::Region
+              awslogs-stream-prefix: ecs
+
+  Alb:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: coffee-shop-alb
+      Scheme: internet-facing
+      Type: application
+      SecurityGroups: [!Ref AlbSG]
+      Subnets: !Ref SubnetIds
+
+  FrontendTG:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: coffee-shop-front
+      VpcId: !Ref VpcId
+      TargetType: ip
+      Protocol: HTTP
+      Port: 80
+      HealthCheckPath: /
+
+  BackendTG:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Name: coffee-shop-api
+      VpcId: !Ref VpcId
+      TargetType: ip
+      Protocol: HTTP
+      Port: 8000
+      HealthCheckPath: /api/health
+      Matcher:
+        HttpCode: '200-399'
+
+  Listener:
+    Type: AWS::ElasticLoadBalancingV2::Listener
+    Properties:
+      LoadBalancerArn: !Ref Alb
+      Port: 80
+      Protocol: HTTP
+      DefaultActions:
+        - Type: forward
+          TargetGroupArn: !Ref FrontendTG
+
+  ApiRule:
+    Type: AWS::ElasticLoadBalancingV2::ListenerRule
+    Properties:
+      ListenerArn: !Ref Listener
+      Priority: 10
+      Conditions:
+        - Field: path-pattern
+          Values: [/api, /api/*]
+      Actions:
+        - Type: forward
+          TargetGroupArn: !Ref BackendTG
+
+  BackendService:
+    Type: AWS::ECS::Service
+    DependsOn: [Listener, ApiRule]
+    Properties:
+      ServiceName: coffee-shop-backend
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref BackendTask
+      DesiredCount: 1
+      LaunchType: FARGATE
+      HealthCheckGracePeriodSeconds: 120
+      DeploymentConfiguration:
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: !Ref SubnetIds
+          SecurityGroups: [!Ref AppSG]
+      LoadBalancers:
+        - ContainerName: backend
+          ContainerPort: 8000
+          TargetGroupArn: !Ref BackendTG
+
+  FrontendService:
+    Type: AWS::ECS::Service
+    DependsOn: [Listener, ApiRule]
+    Properties:
+      ServiceName: coffee-shop-frontend
+      Cluster: !Ref Cluster
+      TaskDefinition: !Ref FrontendTask
+      DesiredCount: 1
+      LaunchType: FARGATE
+      HealthCheckGracePeriodSeconds: 60
+      DeploymentConfiguration:
+        DeploymentCircuitBreaker:
+          Enable: true
+          Rollback: true
+      NetworkConfiguration:
+        AwsvpcConfiguration:
+          AssignPublicIp: ENABLED
+          Subnets: !Ref SubnetIds
+          SecurityGroups: [!Ref AppSG]
+      LoadBalancers:
+        - ContainerName: frontend
+          ContainerPort: 80
+          TargetGroupArn: !Ref FrontendTG
+
+Outputs:
+  ApplicationURL:
+    Description: Open this URL in your browser
+    Value: !Sub 'http://${Alb.DNSName}'
+  ClusterName:
+    Value: !Ref Cluster
+  DatabaseEndpoint:
+    Value: !GetAtt MySQL.Endpoint.Address
+  DatabaseSecret:
+    Value: !Ref DbSecret
