@@ -1,5 +1,13 @@
 # Coffee Shop - Amazon ECS Fargate Deployment
 
+AWS architecture we'll build
+I'll use ECS Fargate + Application Load Balancer + Amazon RDS MySQL. RDS is a better choice than running MySQL as a temporary ECS container because your orders and products need persistent database storage.
+
+
+
+
+
+
 Deploy the existing React + FastAPI + MySQL Coffee Shop application to AWS ECS Fargate.
 
 ## Architecture
